@@ -1,0 +1,285 @@
+From a89ada90b67f2fdf41823eb94a340f7d146e4f9f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 01:40:30 -0400
+Subject: [PATCH] UWP: diagnose memory write watches; refresh GPU data if
+ protection fails
+
+Effects drawn from vertex data the game rewrites every frame were invisible
+on Xbox. The GPU only re-uploads guest memory after a write watch (page
+protection + vectored exception handler) reports a CPU write.
+
+- Log VirtualProtectFromApp failures, the vectored exception handler install
+  result, and how often memory write watches fire.
+- If memory protection ever fails (or clear_memory_page_state is set),
+  invalidate CPU-uploaded shared memory pages at the end of every frame so
+  they're uploaded again.
+- XMA unknown register writes are logged at debug level (they flooded the
+  log, which is flushed on every line on UWP).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ .../rex/graphics/d3d12/command_processor.h    |  1 +
+ include/rex/graphics/shared_memory.h          |  5 ++++
+ include/rex/memory/utils.h                    |  4 +++
+ src/audio/xma_decoder.cpp                     |  2 +-
+ src/core/exception_handler_win.cpp            | 10 +++++++
+ src/core/memory_posix.cpp                     |  2 ++
+ src/core/memory_win.cpp                       | 26 +++++++++++++++++++
+ src/graphics/d3d12/command_processor.cpp      | 22 ++++++++++++++++
+ src/graphics/shared_memory.cpp                |  7 +++++
+ src/kernel/xmemory.cpp                        | 18 +++++++++++--
+ 10 files changed, 94 insertions(+), 3 deletions(-)
+
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 4107690..6f9b849 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -585,6 +585,7 @@ class D3D12CommandProcessor : public CommandProcessor {
+ 
+   std::atomic<bool> pix_capture_requested_ = false;
+   bool pix_capturing_;
++  bool clear_memory_page_state_logged_ = false;
+ 
+   // The current fixed-function drawing state.
+   D3D12_VIEWPORT ff_viewport_;
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index a1aba47..5d4122b 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -33,6 +33,11 @@ class SharedMemory {
+   // Call in the implementation-specific ClearCache.
+   virtual void ClearCache();
+ 
++  // Makes pages uploaded from guest memory by the CPU invalid, so the next
++  // use uploads them again (pages written by the GPU stay valid). A fallback
++  // for when memory write watches can't detect CPU writes.
++  void InvalidateCpuUploadedPages();
++
+   typedef void (*GlobalWatchCallback)(
+       const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+       uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
+diff --git a/include/rex/memory/utils.h b/include/rex/memory/utils.h
+index dfce7a0..cc4cfcf 100644
+--- a/include/rex/memory/utils.h
++++ b/include/rex/memory/utils.h
+@@ -109,6 +109,10 @@ bool DeallocFixed(void* base_address, size_t length,
+ bool Protect(void* base_address, size_t length, PageAccess access,
+              PageAccess* out_old_access = nullptr);
+ 
++// Whether a Protect call has failed. Memory write watches rely on protection,
++// so the GPU code uses this to fall back to refreshing data every frame.
++bool HasProtectFailed();
++
+ // Queries a region of pages to get the access rights. This will modify the
+ // length parameter to the length of pages with the same consecutive access
+ // rights. The length will start from the first byte of the first page of
+diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
+index fc82d46..929bfda 100644
+--- a/src/audio/xma_decoder.cpp
++++ b/src/audio/xma_decoder.cpp
+@@ -341,7 +341,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+           REXAPU_WARN("XMA: Write to unhandled register ({:04X}, {}): {:08X}", r,
+                  register_info->name, value);
+         } else {
+-          REXAPU_WARN("XMA: Write to unknown register ({:04X}): {:08X}", r, value);
++          REXAPU_DEBUG("XMA: Write to unknown register ({:04X}): {:08X}", r, value);
+         }
+         break;
+       }
+diff --git a/src/core/exception_handler_win.cpp b/src/core/exception_handler_win.cpp
+index e59620e..12d45b8 100644
+--- a/src/core/exception_handler_win.cpp
++++ b/src/core/exception_handler_win.cpp
+@@ -14,6 +14,7 @@
+ #if REX_PLATFORM_WIN32
+ 
+ #include <rex/assert.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/platform/win.h>
+ 
+@@ -185,6 +186,15 @@ void ExceptionHandler::Install(Handler fn, void* data) {
+     veh_handle_ =
+         AddVectoredExceptionHandlerCompat(1, ExceptionHandlerCallback);
+     assert_not_null(veh_handle_);
++#if REX_PLATFORM_WINRT
++    if (veh_handle_) {
++      REXLOG_INFO("UWP: vectored exception handler installed");
++    } else {
++      REXLOG_ERROR(
++          "UWP: couldn't install the vectored exception handler - memory "
++          "watches and MMIO won't work");
++    }
++#endif
+ 
+     if (IsDebuggerPresent()) {
+       // TODO(benvanik): do we need a continue handler if a debugger is
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index 37911fd..fbee450 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -260,6 +260,8 @@ bool DeallocFixed(void* base_address, size_t length,
+   }
+ }
+ 
++bool HasProtectFailed() { return false; }
++
+ bool Protect(void* base_address, size_t length, PageAccess access,
+              PageAccess* out_old_access) {
+   if (out_old_access) {
+diff --git a/src/core/memory_win.cpp b/src/core/memory_win.cpp
+index aa7eee2..a218423 100644
+--- a/src/core/memory_win.cpp
++++ b/src/core/memory_win.cpp
+@@ -13,6 +13,10 @@
+ 
+ #include <rex/platform/win.h>
+ 
++#include <atomic>
++
++#include <rex/logging.h>
++
+ #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | \
+                             WINAPI_PARTITION_SYSTEM | WINAPI_PARTITION_GAMES)
+ #define REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
+@@ -135,6 +139,14 @@ bool DeallocFixed(void* base_address, size_t length,
+   return VirtualFree(base_address, length, free_type) ? true : false;
+ }
+ 
++namespace {
++std::atomic<bool> protect_failed{false};
++}  // namespace
++
++bool HasProtectFailed() {
++  return protect_failed.load(std::memory_order_relaxed);
++}
++
+ bool Protect(void* base_address, size_t length, PageAccess access,
+              PageAccess* out_old_access) {
+   if (out_old_access) {
+@@ -150,6 +162,20 @@ bool Protect(void* base_address, size_t length, PageAccess access,
+                                       &old_protect);
+ #endif
+   if (!result) {
++    protect_failed.store(true, std::memory_order_relaxed);
++#ifndef REX_BASE_MEMORY_WIN_USE_DESKTOP_FUNCTIONS
++    // Memory write watches (how the GPU finds out the game changed vertex
++    // data and textures) depend on this, so failures must be visible.
++    static std::atomic<uint32_t> failure_count{0};
++    uint32_t failure_index = failure_count.fetch_add(1);
++    if (failure_index < 8 || !(failure_index & (failure_index + 1))) {
++      REXLOG_WARN(
++          "VirtualProtectFromApp({}, 0x{:X} bytes, 0x{:X}) failed (error {}), "
++          "failure #{}",
++          base_address, length, uint32_t(new_protect), uint32_t(GetLastError()),
++          failure_index + 1);
++    }
++#endif
+     return false;
+   }
+   if (out_old_access) {
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 066ee88..b099cd8 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
++#include <rex/memory/utils.h>
+ #include <rex/profiling.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/graphics/d3d12/graphics_system.h>
+@@ -44,6 +45,11 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false,
+     "Read render-to-texture results on the CPU",
+     "GPU/D3D12");
+ 
++REXCVAR_DEFINE_BOOL(clear_memory_page_state, false,
++    "Upload vertex and other data from guest memory again every frame "
++    "(slower). Used automatically when memory write watches don't work",
++    "GPU");
++
+ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true,
+     "Submit command list when PM4 primary buffer ends",
+     "GPU/D3D12");
+@@ -2970,6 +2976,22 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     closed_frame_submissions_[(frame_current_++) % kQueueFrames] =
+         submission_current_ - 1;
+ 
++    // Without working memory write watches (memory protection failed - seen
++    // on Xbox), data the game changes in place, such as dynamic vertex
++    // buffers for effects, would never be uploaded again.
++    if (shared_memory_ && (REXCVAR_GET(clear_memory_page_state) ||
++                           rex::memory::HasProtectFailed())) {
++      if (!clear_memory_page_state_logged_) {
++        clear_memory_page_state_logged_ = true;
++        REXGPU_INFO(
++            "Re-uploading CPU-written GPU data every frame ({})",
++            REXCVAR_GET(clear_memory_page_state)
++                ? "clear_memory_page_state is on"
++                : "memory protection failed, so write watches don't work");
++      }
++      shared_memory_->InvalidateCpuUploadedPages();
++    }
++
+     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
+       cache_clear_requested_ = false;
+ 
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 2503f9b..3e8b386 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -87,6 +87,13 @@ void SharedMemory::ShutdownCommon() {
+   host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
+ }
+ 
++void SharedMemory::InvalidateCpuUploadedPages() {
++  auto global_lock = global_critical_region_.Acquire();
++  for (SystemPageFlagsBlock& block : system_page_flags_) {
++    block.valid = block.valid_and_gpu_written;
++  }
++}
++
+ void SharedMemory::ClearCache() {
+   // Keeping GPU-written data, so "invalidated by GPU".
+   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, true);
+diff --git a/src/kernel/xmemory.cpp b/src/kernel/xmemory.cpp
+index a5d0c73..40d4d6a 100644
+--- a/src/kernel/xmemory.cpp
++++ b/src/kernel/xmemory.cpp
+@@ -12,6 +12,7 @@
+ #include <rex/kernel/xmemory.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <utility>
+ 
+@@ -470,8 +471,21 @@ bool Memory::AccessViolationCallback(
+   // Will be rounded to physical page boundaries internally, so just pass 1 as
+   // the length - guranteed not to cross page boundaries also.
+   auto physical_heap = static_cast<PhysicalHeap*>(heap);
+-  return physical_heap->TriggerCallbacks(std::move(global_lock_locked_once),
+-                                         virtual_address, 1, is_write, false);
++  bool handled = physical_heap->TriggerCallbacks(
++      std::move(global_lock_locked_once), virtual_address, 1, is_write, false);
++#if REX_PLATFORM_WINRT
++  // Diagnostics: shows that memory write watches work (the GPU relies on them
++  // to see vertex data and textures the game changes).
++  static std::atomic<uint64_t> hit_count{0};
++  uint64_t hit_index = hit_count.fetch_add(1) + 1;
++  if (hit_index == 1 || hit_index == 10 || hit_index == 100 ||
++      hit_index == 1000 || hit_index == 10000 || hit_index == 100000 ||
++      hit_index == 1000000) {
++    REXLOG_INFO("Memory write watch hit #{} at {:08X} ({})", hit_index,
++                virtual_address, handled ? "handled" : "not handled");
++  }
++#endif
++  return handled;
+ }
+ 
+ bool Memory::AccessViolationCallbackThunk(
+-- 
+2.43.0
+

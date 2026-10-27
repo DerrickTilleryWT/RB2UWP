@@ -1,0 +1,50 @@
+From 612a4b9aa5d3884a15ff6d7cf70f8abe260c534f Mon Sep 17 00:00:00 2001
+From: dooset22 <dooset22@gmail.com>
+Date: Mon, 26 Oct 2026 00:43:16 -0400
+Subject: [PATCH] UWP: don't use tiled shared memory by default
+
+On Xbox Series X|S the Direct3D 12 driver hit an internal breakpoint
+(exception 0x80000003 in umd12ddi_arden.dll) in
+D3D12SharedMemory::AllocateSparseHostGpuMemoryRange on the first draw,
+while creating the tile heap / updating tile mappings of the 512 MB
+shared memory buffer. Default d3d12_tiled_shared_memory to false on UWP
+so a regular committed buffer is used; it can still be enabled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ src/graphics/d3d12/shared_memory.cpp | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index 20c8f82..be12a68 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -16,13 +16,23 @@
+ #include <vector>
+ 
+ #include <rex/assert.h>
++#include <rex/platform.h>
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
+-REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true,
++#if REX_PLATFORM_WINRT
++// Off by default on UWP: the Xbox Series X|S Direct3D 12 driver stops the app
++// (an internal breakpoint) when tile mappings are set up for the shared
++// memory buffer, on the first draw. A regular 512 MB buffer is used instead.
++#define REX_D3D12_TILED_SHARED_MEMORY_DEFAULT false
++#else
++#define REX_D3D12_TILED_SHARED_MEMORY_DEFAULT true
++#endif
++REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory,
++    REX_D3D12_TILED_SHARED_MEMORY_DEFAULT,
+     "Use tiled shared memory on D3D12",
+     "GPU/D3D12")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+-- 
+2.43.0
+

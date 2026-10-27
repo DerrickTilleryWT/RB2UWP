@@ -1,0 +1,242 @@
+From 70eda6e00615103e6bfd339fc3c9c20d029022e5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 01:00:53 -0400
+Subject: [PATCH] UWP: keep B from closing the game; FSR output upscaling by
+ default
+
+On Xbox, B sends the system back request, which closes or suspends an app
+that leaves it unhandled. Handle it in the UWP app context.
+
+Add present_effect (bilinear/cas/fsr), present_fsr_sharpness_reduction,
+present_cas_additional_sharpness and present_dither cvars for the final
+output; UWP defaults to FSR.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ include/rex/ui/windowed_app_context_uwp.h |  5 ++
+ src/ui/presenter.cpp                      | 48 +++++++++++
+ src/ui/windowed_app_context_uwp.cpp       | 97 +++++++++++++++++++++++
+ 3 files changed, 150 insertions(+)
+
+diff --git a/include/rex/ui/windowed_app_context_uwp.h b/include/rex/ui/windowed_app_context_uwp.h
+index edbc31e..55e3a6d 100644
+--- a/include/rex/ui/windowed_app_context_uwp.h
++++ b/include/rex/ui/windowed_app_context_uwp.h
+@@ -51,7 +51,12 @@ class UWPWindowedAppContext final : public WindowedAppContext {
+   void WakeUILoop();
+ 
+  private:
++  // Stops the system back request (B on Xbox) from closing the app.
++  void HandleBackButton();
++
+   IUnknown* core_window_ = nullptr;
++  IUnknown* navigation_manager_ = nullptr;  // ISystemNavigationManager
++  int64_t back_requested_token_ = 0;  // EventRegistrationToken::value
+   IUnknown* dispatcher_ = nullptr;  // ICoreDispatcher
+   void* wake_event_ = nullptr;      // HANDLE
+   UWPWindow* window_ = nullptr;
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index a06f4b1..4d39723 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -42,6 +42,33 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90,
+     "UI/Presenter")
+     .range(0, 100);
+ 
++// Final output scaling to the screen. UWP (Xbox) defaults to AMD FSR, since
++// the game's 720p-or-lower image is stretched to a 1080p or 4K screen there.
++#if REX_PLATFORM_WINRT
++#define REX_PRESENT_EFFECT_DEFAULT "fsr"
++#else
++#define REX_PRESENT_EFFECT_DEFAULT "bilinear"
++#endif
++REXCVAR_DEFINE_STRING(present_effect, REX_PRESENT_EFFECT_DEFAULT,
++    "Upscaling of the game image to the screen: bilinear (plain), cas (AMD "
++    "FidelityFX CAS sharpening) or fsr (AMD FidelityFX Super Resolution)",
++    "UI/Presenter")
++    .allowed({"bilinear", "cas", "fsr"});
++
++REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction, 0.2,
++    "FSR sharpness reduction in stops (0 = sharpest, 2 = softest)",
++    "UI/Presenter")
++    .range(0.0, 2.0);
++
++REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness, 0.0,
++    "Extra CAS sharpening (0-1), also used by fsr when not upscaling",
++    "UI/Presenter")
++    .range(0.0, 1.0);
++
++REXCVAR_DEFINE_BOOL(present_dither, true,
++    "Dither the final image to hide color banding",
++    "UI/Presenter");
++
+ namespace rex {
+ namespace ui {
+ 
+@@ -559,6 +586,27 @@ void Presenter::RequestUIPaintFromUIThread() {
+ }
+ 
+ bool Presenter::InitializeCommonSurfaceIndependent() {
++  // Output effect settings from the configuration.
++  {
++    GuestOutputPaintConfig config;
++    const std::string& effect = REXCVAR_GET(present_effect);
++    if (effect == "fsr") {
++      config.SetEffect(GuestOutputPaintConfig::Effect::kFsr);
++    } else if (effect == "cas") {
++      config.SetEffect(GuestOutputPaintConfig::Effect::kCas);
++    } else {
++      config.SetEffect(GuestOutputPaintConfig::Effect::kBilinear);
++    }
++    config.SetFsrSharpnessReduction(
++        float(REXCVAR_GET(present_fsr_sharpness_reduction)));
++    config.SetCasAdditionalSharpness(
++        float(REXCVAR_GET(present_cas_additional_sharpness)));
++    config.SetDither(REXCVAR_GET(present_dither));
++    std::unique_lock<std::mutex> config_lock(guest_output_paint_config_mutex_);
++    guest_output_paint_config_ = config;
++  }
++  REXLOG_INFO("Presenter: output effect {}", REXCVAR_GET(present_effect));
++
+   // Initialize UI frame rate limiting.
+ #if REX_PLATFORM_WIN32
+   dxgi_ui_tick_thread_ = std::thread(&Presenter::DXGIUITickThread, this);
+diff --git a/src/ui/windowed_app_context_uwp.cpp b/src/ui/windowed_app_context_uwp.cpp
+index 675d14c..f7650f7 100644
+--- a/src/ui/windowed_app_context_uwp.cpp
++++ b/src/ui/windowed_app_context_uwp.cpp
+@@ -11,8 +11,11 @@
+ 
+ #if REX_PLATFORM_WINRT
+ 
++#include <atomic>
+ #include <cstdlib>
+ 
++#include <roapi.h>
++#include <winstring.h>
+ #include <wrl/client.h>
+ 
+ #include <windows.ui.core.h>
+@@ -31,6 +34,52 @@ namespace {
+ // signal, and also wakes up at this interval to process CoreWindow events,
+ // which don't signal that event.
+ constexpr DWORD kCoreEventPollIntervalMs = 4;
++
++// {94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}
++constexpr IID kIID_IAgileObject = {
++    0x94ea2b94, 0xe9cc, 0x49e0, {0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90}};
++
++using BackRequestedHandlerInterface =
++    ABI::Windows::Foundation::IEventHandler<core::BackRequestedEventArgs*>;
++
++// Marks every system back request as handled. Agile, so it may be invoked
++// from any thread.
++class BackRequestedHandler final : public BackRequestedHandlerInterface {
++ public:
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
++                                           void** object) override {
++    if (!object) {
++      return E_POINTER;
++    }
++    if (IsEqualIID(riid, __uuidof(IUnknown)) ||
++        IsEqualIID(riid, __uuidof(BackRequestedHandlerInterface)) ||
++        IsEqualIID(riid, kIID_IAgileObject)) {
++      *object = static_cast<BackRequestedHandlerInterface*>(this);
++      AddRef();
++      return S_OK;
++    }
++    *object = nullptr;
++    return E_NOINTERFACE;
++  }
++  ULONG STDMETHODCALLTYPE AddRef() override { return ++reference_count_; }
++  ULONG STDMETHODCALLTYPE Release() override {
++    ULONG count = --reference_count_;
++    if (!count) {
++      delete this;
++    }
++    return count;
++  }
++  HRESULT STDMETHODCALLTYPE Invoke(
++      IInspectable* sender, core::IBackRequestedEventArgs* args) override {
++    if (args) {
++      args->put_Handled(TRUE);
++    }
++    return S_OK;
++  }
++
++ private:
++  std::atomic<ULONG> reference_count_{1};
++};
+ }  // namespace
+ 
+ UWPWindowedAppContext::UWPWindowedAppContext(IUnknown* core_window)
+@@ -49,6 +98,12 @@ UWPWindowedAppContext::~UWPWindowedAppContext() {
+     CloseHandle(static_cast<HANDLE>(wake_event_));
+     wake_event_ = nullptr;
+   }
++  if (navigation_manager_) {
++    static_cast<core::ISystemNavigationManager*>(navigation_manager_)
++        ->remove_BackRequested(EventRegistrationToken{back_requested_token_});
++    navigation_manager_->Release();
++    navigation_manager_ = nullptr;
++  }
+   if (dispatcher_) {
+     dispatcher_->Release();
+     dispatcher_ = nullptr;
+@@ -74,10 +129,52 @@ bool UWPWindowedAppContext::Initialize() {
+   }
+   dispatcher_ = dispatcher.Detach();
+ 
++  HandleBackButton();
++
+   wake_event_ = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+   return wake_event_ != nullptr;
+ }
+ 
++void UWPWindowedAppContext::HandleBackButton() {
++  // On Xbox, B on the controller (and Escape/Backspace on a keyboard) also
++  // sends the system "back" request. An app that leaves it unhandled is sent
++  // to the background or closed, so pressing B in the game's menus would quit
++  // the game. Mark every back request as handled - the game still reads B
++  // through the gamepad API like any other button.
++  static const wchar_t kClassName[] =
++      L"Windows.UI.Core.SystemNavigationManager";
++  HSTRING_HEADER class_name_header;
++  HSTRING class_name;
++  if (FAILED(WindowsCreateStringReference(
++          kClassName, UINT32(sizeof(kClassName) / sizeof(wchar_t) - 1),
++          &class_name_header, &class_name))) {
++    return;
++  }
++  ComPtr<core::ISystemNavigationManagerStatics> statics;
++  if (FAILED(RoGetActivationFactory(class_name,
++                                    IID_PPV_ARGS(statics.GetAddressOf())))) {
++    REXLOG_WARN("UWP: SystemNavigationManager is unavailable, B may exit");
++    return;
++  }
++  ComPtr<core::ISystemNavigationManager> navigation_manager;
++  if (FAILED(statics->GetForCurrentView(navigation_manager.GetAddressOf())) ||
++      !navigation_manager) {
++    REXLOG_WARN("UWP: no SystemNavigationManager for the view, B may exit");
++    return;
++  }
++  ComPtr<BackRequestedHandlerInterface> handler;
++  handler.Attach(new BackRequestedHandler());
++  EventRegistrationToken token = {};
++  if (FAILED(navigation_manager->add_BackRequested(handler.Get(),
++                                                               &token))) {
++    REXLOG_WARN("UWP: couldn't handle the back button, B may exit");
++    return;
++  }
++  back_requested_token_ = token.value;
++  navigation_manager_ = navigation_manager.Detach();
++  REXLOG_INFO("UWP: back button (B) handled by the game");
++}
++
+ void UWPWindowedAppContext::WakeUILoop() {
+   if (wake_event_) {
+     SetEvent(static_cast<HANDLE>(wake_event_));
+-- 
+2.43.0
+

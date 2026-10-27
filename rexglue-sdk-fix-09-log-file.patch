@@ -1,0 +1,172 @@
+From ef50922d83bf702893f22df40540c7425aa680e8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 01:18:51 -0400
+Subject: [PATCH] Open the log file even if something logged before logging was
+ set up
+
+The UWP back button handler logged before the app configured logging, which
+initialized logging without a file; the app's InitLogging then only updated
+levels, so no log.txt was written. Re-initialization now opens the requested
+log file if none is open, and the back button handler only logs failures.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ src/core/logging.cpp                | 87 +++++++++++++++++++----------
+ src/ui/windowed_app_context_uwp.cpp |  6 +-
+ 2 files changed, 62 insertions(+), 31 deletions(-)
+
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index bf61dc4..0ff0579 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -50,6 +50,45 @@ namespace {
+     // Stored configuration
+     LogConfig g_config;
+ 
++    // Whether a log file is being written.
++    bool g_file_sink_open = false;
++
++    // The log file sink, or nullptr when there's no file or it can't be
++    // created.
++    spdlog::sink_ptr CreateFileSink(const char* log_file) {
++        if (!log_file || !*log_file) {
++            return nullptr;
++        }
++#if REX_PLATFORM_WINRT
++        // The working directory of a UWP app is its read-only install folder,
++        // so relative log paths go to the writable LocalState folder (which
++        // the Xbox Device Portal file explorer can open). A log file that
++        // can't be created must not stop the app.
++        std::filesystem::path log_path(log_file);
++        if (log_path.is_relative()) {
++            auto local_folder = rex::filesystem::GetUserFolder();
++            if (!local_folder.empty()) {
++                log_path = local_folder / log_path;
++            }
++        }
++        try {
++            auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
++                log_path.string(), true);
++            file_sink->set_level(spdlog::level::trace);
++            file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%n] [t%t] %v");
++            return file_sink;
++        } catch (const spdlog::spdlog_ex&) {
++            return nullptr;
++        }
++#else
++        auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
++            log_file, true);
++        file_sink->set_level(spdlog::level::trace);
++        file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%n] [t%t] %v");
++        return file_sink;
++#endif
++    }
++
+ #if REX_PLATFORM_WINRT
+     // UWP builds compile spdlog with SPDLOG_DISABLE_DEFAULT_LOGGER: its
+     // built-in default logger writes to a console, which UWP apps don't have
+@@ -77,7 +116,22 @@ void InitLogging(const LogConfig& config) {
+     std::lock_guard<std::mutex> lock(g_init_mutex);
+ 
+     if (g_initialized) {
+-        // Re-initialization: update levels only
++        // Re-initialization: update levels. Something may have logged before
++        // the app configured logging, which initialized it without a file -
++        // open the requested file now. This happens during startup, before
++        // other threads log, so changing the loggers' sinks is safe.
++        if (!g_file_sink_open) {
++            if (auto file_sink = CreateFileSink(config.log_file)) {
++                g_sinks.push_back(file_sink);
++                g_file_sink_open = true;
++                for (auto& logger : g_loggers) {
++                    if (logger) {
++                        logger->sinks().push_back(file_sink);
++                    }
++                }
++            }
++        }
++        // Update levels
+         for (size_t i = 0; i < static_cast<size_t>(LogCategory::Count); ++i) {
+             auto level = config.category_levels[i].value_or(config.default_level);
+             if (g_loggers[i]) {
+@@ -104,35 +158,9 @@ void InitLogging(const LogConfig& config) {
+         g_sinks.push_back(console_sink);
+     }
+ 
+-    if (config.log_file) {
+-#if REX_PLATFORM_WINRT
+-        // The working directory of a UWP app is its read-only install folder,
+-        // so relative log paths go to the writable LocalState folder (which
+-        // the Xbox Device Portal file explorer can open). A log file that
+-        // can't be created must not stop the app.
+-        std::filesystem::path log_path(config.log_file);
+-        if (log_path.is_relative()) {
+-            auto local_folder = rex::filesystem::GetUserFolder();
+-            if (!local_folder.empty()) {
+-                log_path = local_folder / log_path;
+-            }
+-        }
+-        try {
+-            auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
+-                log_path.string(), true);
+-            file_sink->set_level(spdlog::level::trace);
+-            file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%n] [t%t] %v");
+-            g_sinks.push_back(file_sink);
+-        } catch (const spdlog::spdlog_ex&) {
+-            // Continue with the remaining sinks.
+-        }
+-#else
+-        auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
+-            config.log_file, true);
+-        file_sink->set_level(spdlog::level::trace);
+-        file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%n] [t%t] %v");
++    if (auto file_sink = CreateFileSink(config.log_file)) {
+         g_sinks.push_back(file_sink);
+-#endif
++        g_file_sink_open = true;
+     }
+ 
+     // Create per-category loggers
+@@ -202,6 +230,7 @@ void ShutdownLogging() {
+         logger.reset();
+     }
+     g_sinks.clear();
++    g_file_sink_open = false;
+     g_initialized = false;
+ }
+ 
+diff --git a/src/ui/windowed_app_context_uwp.cpp b/src/ui/windowed_app_context_uwp.cpp
+index f7650f7..3ddcafe 100644
+--- a/src/ui/windowed_app_context_uwp.cpp
++++ b/src/ui/windowed_app_context_uwp.cpp
+@@ -70,7 +70,8 @@ class BackRequestedHandler final : public BackRequestedHandlerInterface {
+     return count;
+   }
+   HRESULT STDMETHODCALLTYPE Invoke(
+-      IInspectable* sender, core::IBackRequestedEventArgs* args) override {
++      [[maybe_unused]] IInspectable* sender,
++      core::IBackRequestedEventArgs* args) override {
+     if (args) {
+       args->put_Handled(TRUE);
+     }
+@@ -141,6 +142,8 @@ void UWPWindowedAppContext::HandleBackButton() {
+   // to the background or closed, so pressing B in the game's menus would quit
+   // the game. Mark every back request as handled - the game still reads B
+   // through the gamepad API like any other button.
++  // This runs before the app sets up logging (and the log file), so only
++  // failures are logged here.
+   static const wchar_t kClassName[] =
+       L"Windows.UI.Core.SystemNavigationManager";
+   HSTRING_HEADER class_name_header;
+@@ -172,7 +175,6 @@ void UWPWindowedAppContext::HandleBackButton() {
+   }
+   back_requested_token_ = token.value;
+   navigation_manager_ = navigation_manager.Detach();
+-  REXLOG_INFO("UWP: back button (B) handled by the game");
+ }
+ 
+ void UWPWindowedAppContext::WakeUILoop() {
+-- 
+2.43.0
+

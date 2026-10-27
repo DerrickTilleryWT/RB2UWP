@@ -1,0 +1,551 @@
+From 14aa7871cbef486afa525e9bdc6f0417324f8609 Mon Sep 17 00:00:00 2001
+From: dooset22 <dooset22@gmail.com>
+Date: Sun, 25 Oct 2026 22:26:37 -0400
+Subject: [PATCH] UWP: crash reports and startup diagnostics in the log
+
+The first Xbox run exited right after creating its first graphics
+pipeline without logging why. On UWP:
+
+- Log unhandled exceptions (code, faulting module+offset, access
+  violation details, call stack), std::terminate and CRT invalid
+  parameter errors.
+- FatalError and failed assertions write to the log before aborting;
+  stderr goes nowhere on Xbox. GPU device loss ends in FatalError.
+- Log the D3D12 device removed reason, the CoreWindow swap chain, the
+  first presents and present failures, window open/close/resize and
+  UI loop start/end.
+- Flush the log after every message.
+- Link the app with /MAP so crash offsets can be mapped to functions.
+
+Also fix a race in Presenter::DXGIUITickThread, which used the shared
+output pointer after unlocking the mutex instead of its local reference.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ cmake/uwp/rexglue_uwp.cmake              |   3 +
+ include/rex/assert.h                     |  16 ++
+ include/rex/platform/uwp.h               |   5 +
+ src/core/logging.cpp                     |  14 ++
+ src/core/platform_uwp.cpp                | 186 +++++++++++++++++++++++
+ src/graphics/d3d12/command_processor.cpp |   2 +
+ src/ui/d3d12/d3d12_presenter.cpp         |  27 ++++
+ src/ui/presenter.cpp                     |   4 +-
+ src/ui/window_uwp.cpp                    |   6 +
+ src/ui/windowed_app_context_uwp.cpp      |  19 ++-
+ src/ui/windowed_app_main_uwp.cpp         |  15 +-
+ 11 files changed, 288 insertions(+), 9 deletions(-)
+
+diff --git a/cmake/uwp/rexglue_uwp.cmake b/cmake/uwp/rexglue_uwp.cmake
+index 72cbd5b..7b13abf 100644
+--- a/cmake/uwp/rexglue_uwp.cmake
++++ b/cmake/uwp/rexglue_uwp.cmake
+@@ -50,6 +50,9 @@ function(rexglue_uwp_app target)
+ 
+     # The executable runs in the app container.
+     target_link_options(${target} PRIVATE "LINKER:/APPCONTAINER")
++    # A map file (<target>.map next to the executable) turns the
++    # module+offset addresses in crash reports into function names.
++    target_link_options(${target} PRIVATE "LINKER:/MAP")
+ 
+     # Manifest: substitute the package fields now, and the executable name and
+     # C runtime package (debug or release) per configuration.
+diff --git a/include/rex/assert.h b/include/rex/assert.h
+index c78daab..f9178eb 100644
+--- a/include/rex/assert.h
++++ b/include/rex/assert.h
+@@ -21,6 +21,11 @@
+ 
+ namespace rex {
+ 
++// Writes a fatal error message to the log and flushes it (defined in
++// logging.cpp). Used on UWP, where stderr goes nowhere, so fatal errors and
++// failed assertions still leave a trace in log.txt before the app aborts.
++void ReportFatalErrorToLog(const char* message);
++
+ #define static_assert_size(type, size) \
+   static_assert(sizeof(type) == size,  \
+                 "bad definition for " #type ": must be " #size " bytes")
+@@ -51,6 +56,14 @@ namespace rex {
+   fprintf(stderr, "Assertion failed: %s\n  Expression: %s\n  Location: %s:%d\n",
+           message, expr, file, line);
+   fflush(stderr);
++#if REX_PLATFORM_WINRT
++  {
++    std::string report = std::string("Assertion failed: ") +
++                         (message ? message : "") + " | " + (expr ? expr : "") +
++                         " | " + (file ? file : "") + ":" + std::to_string(line);
++    ReportFatalErrorToLog(report.c_str());
++  }
++#endif
+   std::abort();
+ }
+ 
+@@ -128,6 +141,9 @@ namespace rex {
+   // Print to stderr and terminate
+   fprintf(stderr, "FATAL ERROR: %s\n", message);
+   fflush(stderr);
++#if REX_PLATFORM_WINRT
++  ReportFatalErrorToLog(message);
++#endif
+   std::abort();
+ }
+ 
+diff --git a/include/rex/platform/uwp.h b/include/rex/platform/uwp.h
+index 822671b..380811f 100644
+--- a/include/rex/platform/uwp.h
++++ b/include/rex/platform/uwp.h
+@@ -44,6 +44,11 @@ T GetSystemProc(const char* name) {
+   return reinterpret_cast<T>(GetSystemProcAddress(name));
+ }
+ 
++// Makes crashes leave a report in the log: unhandled exceptions (with the
++// code, the faulting address as module+offset and the call stack),
++// std::terminate and C runtime invalid parameter errors. Call once, early.
++void InstallCrashLogging();
++
+ }  // namespace rex::platform::uwp
+ 
+ #endif  // REX_PLATFORM_WINRT
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 942b401..bf61dc4 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -66,6 +66,13 @@ namespace {
+ #endif
+ }
+ 
++void ReportFatalErrorToLog(const char* message) {
++    if (auto* logger = spdlog::default_logger_raw()) {
++        logger->critical("FATAL: {}", message ? message : "(no message)");
++        logger->flush();
++    }
++}
++
+ void InitLogging(const LogConfig& config) {
+     std::lock_guard<std::mutex> lock(g_init_mutex);
+ 
+@@ -141,11 +148,18 @@ void InitLogging(const LogConfig& config) {
+         logger->set_level(level);
+ 
+         // Configure flush behavior
++#if REX_PLATFORM_WINRT
++        // UWP: write every message to the file right away. The log is the
++        // main way to find out why the app stopped on Xbox, and a crash loses
++        // whatever is still buffered.
++        logger->flush_on(spdlog::level::trace);
++#else
+         if (level <= spdlog::level::debug) {
+             logger->flush_on(spdlog::level::trace);
+         } else {
+             logger->flush_on(spdlog::level::warn);
+         }
++#endif
+ 
+         // Register with spdlog for global access
+         spdlog::register_logger(logger);
+diff --git a/src/core/platform_uwp.cpp b/src/core/platform_uwp.cpp
+index 8ed1abe..c6c2530 100644
+--- a/src/core/platform_uwp.cpp
++++ b/src/core/platform_uwp.cpp
+@@ -17,9 +17,16 @@
+ 
+ #include <windows.storage.h>
+ 
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++#include <exception>
+ #include <iterator>
+ #include <string>
+ 
++#include <fmt/format.h>
++#include <spdlog/spdlog.h>
++
+ namespace rex::platform::uwp {
+ 
+ namespace {
+@@ -191,6 +198,185 @@ void* GetSystemProcAddress(const char* name) {
+   return nullptr;
+ }
+ 
++//=============================================================================
++// Crash logging
++//=============================================================================
++
++namespace {
++
++using TopLevelFilter = LONG(WINAPI*)(EXCEPTION_POINTERS*);
++using SetUnhandledExceptionFilterFn = TopLevelFilter(WINAPI*)(TopLevelFilter);
++using GetModuleFileNameWFn = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
++// RtlLookupFunctionEntry and RtlVirtualUnwind, with the unwind table types
++// passed as void* (the declarations aren't in every SDK's UWP partition).
++using RtlLookupFunctionEntryFn = void*(NTAPI*)(DWORD64 control_pc,
++                                               PDWORD64 image_base,
++                                               void* history_table);
++using RtlVirtualUnwindFn = void*(NTAPI*)(DWORD handler_type,
++                                         DWORD64 image_base,
++                                         DWORD64 control_pc,
++                                         void* function_entry,
++                                         PCONTEXT context,
++                                         PVOID* handler_data,
++                                         PDWORD64 establisher_frame,
++                                         void* context_pointers);
++
++std::atomic<bool> crash_logged_{false};
++TopLevelFilter previous_filter_ = nullptr;
++
++void CrashLogLine(const std::string& line) {
++  if (auto* logger = spdlog::default_logger_raw()) {
++    logger->critical("{}", line);
++    logger->flush();
++  }
++}
++
++// "module.dll+0x1234" for an address inside a loaded module.
++std::string DescribeAddress(uint64_t address) {
++  HMODULE module = ModuleFromAddress(reinterpret_cast<const void*>(address));
++  if (!module) {
++    return fmt::format("0x{:X}", address);
++  }
++  static const auto get_module_file_name =
++      GetSystemProc<GetModuleFileNameWFn>("GetModuleFileNameW");
++  std::string name = "module";
++  if (get_module_file_name) {
++    wchar_t buffer[MAX_PATH];
++    DWORD length = get_module_file_name(module, buffer, MAX_PATH);
++    if (length && length < MAX_PATH) {
++      std::wstring wide(buffer, length);
++      size_t slash = wide.find_last_of(L"\\/");
++      if (slash != std::wstring::npos) {
++        wide = wide.substr(slash + 1);
++      }
++      name.clear();
++      for (wchar_t c : wide) {
++        name.push_back(c < 0x80 ? char(c) : '?');
++      }
++    }
++  }
++  return fmt::format("{}+0x{:X}", name,
++                     address - reinterpret_cast<uint64_t>(module));
++}
++
++bool IsReadable(uint64_t address, size_t size) {
++  MEMORY_BASIC_INFORMATION info = {};
++  if (!VirtualQuery(reinterpret_cast<const void*>(address), &info,
++                    sizeof(info))) {
++    return false;
++  }
++  if (info.State != MEM_COMMIT ||
++      (info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
++    return false;
++  }
++  uint64_t region_end =
++      reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
++  return address + size <= region_end;
++}
++
++// Logs the call stack of the crashed thread, unwinding from its context.
++void LogStack(const CONTEXT* crash_context) {
++  static const auto lookup =
++      GetSystemProc<RtlLookupFunctionEntryFn>("RtlLookupFunctionEntry");
++  static const auto unwind =
++      GetSystemProc<RtlVirtualUnwindFn>("RtlVirtualUnwind");
++  if (!crash_context) {
++    return;
++  }
++  CONTEXT context = *crash_context;
++  CrashLogLine("CRASH: call stack (most recent first):");
++  for (int frame = 0; frame < 48; ++frame) {
++    uint64_t pc = context.Rip;
++    if (!pc) {
++      break;
++    }
++    CrashLogLine(fmt::format("CRASH:   #{:02} {}", frame, DescribeAddress(pc)));
++    if (!lookup || !unwind) {
++      break;
++    }
++    DWORD64 image_base = 0;
++    void* function_entry = lookup(pc, &image_base, nullptr);
++    if (function_entry) {
++      PVOID handler_data = nullptr;
++      DWORD64 establisher_frame = 0;
++      unwind(0 /* UNW_FLAG_NHANDLER */, image_base, pc, function_entry,
++             &context, &handler_data, &establisher_frame, nullptr);
++    } else {
++      // Leaf function: the return address is at the top of the stack.
++      if (!IsReadable(context.Rsp, sizeof(uint64_t))) {
++        break;
++      }
++      context.Rip = *reinterpret_cast<const uint64_t*>(context.Rsp);
++      context.Rsp += sizeof(uint64_t);
++    }
++  }
++}
++
++LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
++  if (!crash_logged_.exchange(true) && info && info->ExceptionRecord) {
++    const EXCEPTION_RECORD* record = info->ExceptionRecord;
++    CrashLogLine(fmt::format(
++        "CRASH: unhandled exception 0x{:08X} at {} on thread {}",
++        uint32_t(record->ExceptionCode),
++        DescribeAddress(reinterpret_cast<uint64_t>(record->ExceptionAddress)),
++        GetCurrentThreadId()));
++    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
++        record->NumberParameters >= 2) {
++      const char* kind = record->ExceptionInformation[0] == 0   ? "reading"
++                         : record->ExceptionInformation[0] == 1 ? "writing"
++                                                                : "executing";
++      CrashLogLine(fmt::format("CRASH: access violation {} address 0x{:X}",
++                               kind, record->ExceptionInformation[1]));
++    }
++    LogStack(info->ContextRecord);
++  }
++  return previous_filter_ ? previous_filter_(info) : EXCEPTION_CONTINUE_SEARCH;
++}
++
++void InvalidParameterHandler(const wchar_t* expression,
++                             const wchar_t* function, const wchar_t* file,
++                             unsigned int line, uintptr_t) {
++  auto narrow = [](const wchar_t* text) {
++    std::string result;
++    for (; text && *text; ++text) {
++      result.push_back(*text < 0x80 ? char(*text) : '?');
++    }
++    return result;
++  };
++  CrashLogLine(fmt::format(
++      "CRASH: C runtime invalid parameter: {} in {} ({}:{})",
++      narrow(expression), narrow(function), narrow(file), line));
++}
++
++}  // namespace
++
++void InstallCrashLogging() {
++  static bool installed = false;
++  if (installed) {
++    return;
++  }
++  installed = true;
++  if (auto set_filter = GetSystemProc<SetUnhandledExceptionFilterFn>(
++          "SetUnhandledExceptionFilter")) {
++    previous_filter_ = set_filter(CrashFilter);
++  }
++  std::set_terminate([] {
++    std::string what = "no active exception";
++    if (std::exception_ptr exception = std::current_exception()) {
++      try {
++        std::rethrow_exception(exception);
++      } catch (const std::exception& e) {
++        what = e.what();
++      } catch (...) {
++        what = "a non-standard C++ exception";
++      }
++    }
++    CrashLogLine("CRASH: std::terminate called (" + what + ")");
++    std::abort();
++  });
++  _set_invalid_parameter_handler(InvalidParameterHandler);
++}
++
+ }  // namespace rex::platform::uwp
+ 
+ #endif  // REX_PLATFORM_WINRT
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index f3fefd5..066ee88 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -2759,6 +2759,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+   HRESULT device_removed_reason = device->GetDeviceRemovedReason();
+   if (FAILED(device_removed_reason)) {
+     device_removed_ = true;
++    REXGPU_ERROR("D3D12 device removed (reason 0x{:08X})",
++                 uint32_t(device_removed_reason));
+     graphics_system_->OnHostGpuLossFromAnyThread(device_removed_reason !=
+                                                  DXGI_ERROR_DEVICE_REMOVED);
+     return false;
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 7f54023..4e4b5c8 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -332,6 +332,13 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
+               "CoreWindow");
+           return SurfacePaintConnectResult::kFailure;
+         }
++        REXLOG_INFO(
++            "D3D12Presenter: created a {}x{} swap chain for the CoreWindow "
++            "(tearing {})",
++            swap_chain_desc.Width, swap_chain_desc.Height,
++            (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
++                ? "allowed"
++                : "not allowed");
+       } break;
+ #endif
+       default:
+@@ -1096,6 +1103,26 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
+   paint_context_.present_submission_tracker.NextSubmission();
++#if REX_PLATFORM_WINRT
++  {
++    // Diagnostics for UWP (Xbox): note the first presents and any failures.
++    static std::atomic<uint32_t> present_count{0};
++    static std::atomic<uint32_t> failure_count{0};
++    uint32_t count = ++present_count;
++    if (FAILED(present_result)) {
++      if (++failure_count <= 10) {
++        HRESULT removed_reason =
++            provider_.GetDevice()->GetDeviceRemovedReason();
++        REXLOG_ERROR(
++            "D3D12Presenter: Present #{} failed (0x{:08X}, device removed "
++            "reason 0x{:08X})",
++            count, uint32_t(present_result), uint32_t(removed_reason));
++      }
++    } else if (count <= 3 || count == 60) {
++      REXLOG_INFO("D3D12Presenter: Present #{} succeeded", count);
++    }
++  }
++#endif
+   switch (present_result) {
+     case DXGI_ERROR_DEVICE_REMOVED:
+       return PaintResult::kGpuLostExternally;
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 2ab9f50..a06f4b1 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -1425,7 +1425,9 @@ void Presenter::DXGIUITickThread() {
+     {
+       Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
+       dxgi_ui_tick_lock.unlock();
+-      wait_succeeded = SUCCEEDED(dxgi_ui_tick_output_->WaitForVBlank());
++      // Use the local reference: the member may be reset by another thread
++      // while the mutex is unlocked.
++      wait_succeeded = SUCCEEDED(dxgi_output->WaitForVBlank());
+     }
+     dxgi_ui_tick_lock.lock();
+     if (wait_succeeded) {
+diff --git a/src/ui/window_uwp.cpp b/src/ui/window_uwp.cpp
+index 48e17ca..6d3f50c 100644
+--- a/src/ui/window_uwp.cpp
++++ b/src/ui/window_uwp.cpp
+@@ -81,11 +81,15 @@ bool UWPWindow::OpenImpl() {
+                                             height, scale_)) {
+     last_physical_width_ = width;
+     last_physical_height_ = height;
++    REXLOG_INFO("UWP: window opened, {}x{} pixels (scale {})", width, height,
++                scale_);
+     OnDesiredLogicalSizeUpdate(SizeToLogical(width), SizeToLogical(height));
+     OnActualSizeUpdate(width, height, destruction_receiver);
+     if (destruction_receiver.IsWindowDestroyed()) {
+       return true;
+     }
++  } else {
++    REXLOG_WARN("UWP: window opened, but its size couldn't be read");
+   }
+   last_size_poll_ = std::chrono::steady_clock::now();
+   OnFocusUpdate(true, destruction_receiver);
+@@ -93,6 +97,7 @@ bool UWPWindow::OpenImpl() {
+ }
+ 
+ void UWPWindow::RequestCloseImpl() {
++  REXLOG_INFO("UWP: window close requested");
+   // There's no window to destroy - the CoreWindow lives as long as the app.
+   // Run the closing sequence (OnBeforeClose notifies the listeners' OnClosing)
+   // so the app shuts down like when a desktop window is closed.
+@@ -148,6 +153,7 @@ void UWPWindow::UpdateSize(WindowDestructionReceiver& destruction_receiver) {
+     }
+   }
+   if (width != last_physical_width_ || height != last_physical_height_) {
++    REXLOG_INFO("UWP: window size changed to {}x{}", width, height);
+     last_physical_width_ = width;
+     last_physical_height_ = height;
+     OnDesiredLogicalSizeUpdate(SizeToLogical(width), SizeToLogical(height));
+diff --git a/src/ui/windowed_app_context_uwp.cpp b/src/ui/windowed_app_context_uwp.cpp
+index ddd7311..675d14c 100644
+--- a/src/ui/windowed_app_context_uwp.cpp
++++ b/src/ui/windowed_app_context_uwp.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include <windows.ui.core.h>
+ 
++#include <rex/logging.h>
+ #include <rex/ui/window_uwp.h>
+ 
+ namespace rex {
+@@ -94,12 +95,17 @@ int UWPWindowedAppContext::RunMainMessageLoop() {
+   auto* dispatcher = static_cast<core::ICoreDispatcher*>(dispatcher_);
+   while (!HasQuitFromUIThread()) {
+     // Window activation, visibility, the system's suspend requests and so on.
+-    if (dispatcher &&
+-        FAILED(dispatcher->ProcessEvents(
+-            core::CoreProcessEventsOption_ProcessAllIfPresent))) {
+-      // The window is gone - nothing more can be shown.
+-      QuitFromUIThread();
+-      break;
++    if (dispatcher) {
++      HRESULT process_result = dispatcher->ProcessEvents(
++          core::CoreProcessEventsOption_ProcessAllIfPresent);
++      if (FAILED(process_result)) {
++        // The window is gone - nothing more can be shown.
++        REXLOG_ERROR(
++            "UWP: CoreDispatcher::ProcessEvents failed (0x{:08X}), quitting",
++            uint32_t(process_result));
++        QuitFromUIThread();
++        break;
++      }
+     }
+     ExecutePendingFunctionsFromUIThread();
+     if (HasQuitFromUIThread()) {
+@@ -114,6 +120,7 @@ int UWPWindowedAppContext::RunMainMessageLoop() {
+     WaitForSingleObjectEx(static_cast<HANDLE>(wake_event_),
+                           kCoreEventPollIntervalMs, FALSE);
+   }
++  REXLOG_INFO("UWP: UI loop quit requested");
+   return EXIT_SUCCESS;
+ }
+ 
+diff --git a/src/ui/windowed_app_main_uwp.cpp b/src/ui/windowed_app_main_uwp.cpp
+index 4d58526..a777be3 100644
+--- a/src/ui/windowed_app_main_uwp.cpp
++++ b/src/ui/windowed_app_main_uwp.cpp
+@@ -39,6 +39,7 @@
+ #include <windows.ui.core.h>
+ 
+ #include <rex/cvar.h>
++#include <rex/logging.h>
+ #include <rex/platform/uwp.h>
+ #include <rex/ui/windowed_app.h>
+ #include <rex/ui/windowed_app_context_uwp.h>
+@@ -124,10 +125,17 @@ int RunWindowedApp(IUnknown* core_window) {
+     }
+     app->SetParsedArguments(std::move(parsed));
+ 
+-    result =
+-        app->OnInitialize() ? app_context.RunMainMessageLoop() : EXIT_FAILURE;
++    if (app->OnInitialize()) {
++      REXLOG_INFO("UWP: app initialized, running the UI loop");
++      result = app_context.RunMainMessageLoop();
++      REXLOG_INFO("UWP: UI loop ended (exit code {})", result);
++    } else {
++      REXLOG_ERROR("UWP: app initialization failed");
++      result = EXIT_FAILURE;
++    }
+ 
+     app->InvokeOnDestroy();
++    REXLOG_INFO("UWP: app shut down");
+   }
+   return result;
+ }
+@@ -249,6 +257,9 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev,
+   (void)command_line;
+   (void)show_cmd;
+ 
++  // Before anything else, so any crash leaves a report in log.txt.
++  rex::platform::uwp::InstallCrashLogging();
++
+   if (FAILED(RoInitialize(RO_INIT_MULTITHREADED))) {
+     return EXIT_FAILURE;
+   }
+-- 
+2.43.0
+

@@ -1,0 +1,29 @@
+From 2a62f5aac54a7bc5594f2bdca0f0785032642fc9 Mon Sep 17 00:00:00 2001
+From: dooset22 <dooset22@gmail.com>
+Date: Sun, 25 Oct 2026 21:08:07 -0400
+Subject: [PATCH] Use the ReXGlue UWP toolchain file for the Xbox presets
+
+So CMake's compiler checks link against WindowsApp.lib, which the
+app-container C runtime needs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ CMakePresets.json | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/CMakePresets.json b/CMakePresets.json
+index ac5d308..52fbfc1 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -37,6 +37,7 @@
+             "hidden": true,
+             "inherits": "windows-base",
+             "description": "Xbox Developer Mode (UWP). Needs REXSDK_UWP set to a UWP build of the ReXGlue SDK, and a 'vcvarsall.bat x64 uwp' prompt.",
++            "toolchainFile": "$penv{REXSDK_UWP}/share/rexglue/uwp/rexglue_uwp_toolchain_file.cmake",
+             "environment": { "REXSDK": "$penv{REXSDK_UWP}" }
+         },
+         {
+-- 
+2.43.0
+

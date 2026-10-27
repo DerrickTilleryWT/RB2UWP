@@ -1,0 +1,117 @@
+From d190caa2b262090e54287857bdd4124f60a9601a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 02:06:20 -0400
+Subject: [PATCH] Log pipeline states, first use of texture formats and
+ args.txt settings
+
+Diagnostics for effects that don't show up on Xbox: the blend, depth,
+topology and geometry shader state of each new pipeline, each guest texture
+format the first time it's loaded (and whether it can be), and the args.txt
+settings in effect.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ src/graphics/d3d12/pipeline_cache.cpp | 25 +++++++++++++++++++++++++
+ src/graphics/d3d12/texture_cache.cpp  | 27 ++++++++++++++++++++++-----
+ src/ui/windowed_app_main_uwp.cpp      |  8 ++++++++
+ 3 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index e28b396..55b72a1 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -2810,6 +2810,31 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
+     REXGPU_INFO("Creating graphics pipeline with VS {:016X}",
+              runtime_description.vertex_shader->shader().ucode_data_hash());
+   }
++  {
++    // The state, for telling which draws are which (for instance, additively
++    // blended effects) when looking into rendering problems.
++    const PipelineRenderTarget& rt0 = description.render_targets[0];
++    REXGPU_INFO(
++        "  pipeline state: VS mod {:X}, PS mod {:X}, topology {}, GS {}, "
++        "cull {}, MSAA {}, depth func {} write {}, stencil {}, RT0 used {} "
++        "format {} blend {}/{} op {} alpha {}/{} op {} mask {:X}, RTs used "
++        "{}{}{}{}",
++        description.vertex_shader_modification,
++        description.pixel_shader_modification,
++        uint32_t(description.primitive_topology_type_or_tessellation_mode),
++        uint32_t(description.geometry_shader), uint32_t(description.cull_mode),
++        1u << uint32_t(description.host_msaa_samples),
++        uint32_t(description.depth_func), uint32_t(description.depth_write),
++        uint32_t(description.stencil_enable), uint32_t(rt0.used),
++        uint32_t(rt0.format), uint32_t(rt0.src_blend),
++        uint32_t(rt0.dest_blend), uint32_t(rt0.blend_op),
++        uint32_t(rt0.src_blend_alpha), uint32_t(rt0.dest_blend_alpha),
++        uint32_t(rt0.blend_op_alpha), uint32_t(rt0.write_mask),
++        uint32_t(description.render_targets[0].used),
++        uint32_t(description.render_targets[1].used),
++        uint32_t(description.render_targets[2].used),
++        uint32_t(description.render_targets[3].used));
++  }
+ 
+   D3D12_GRAPHICS_PIPELINE_STATE_DESC state_desc;
+   std::memset(&state_desc, 0, sizeof(state_desc));
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 32f1ecb..064b65f 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -1642,13 +1642,30 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+ 
+   // Get the pipeline.
+   LoadShaderIndex load_shader = GetLoadShaderIndex(texture_key);
+-  if (load_shader == kLoadShaderIndexUnknown) {
+-    return false;
+-  }
+   bool texture_resolution_scaled = texture_key.scaled_resolve;
+   ID3D12PipelineState* pipeline =
+-      texture_resolution_scaled ? load_pipelines_scaled_[load_shader].Get()
+-                                : load_pipelines_[load_shader].Get();
++      load_shader == kLoadShaderIndexUnknown
++          ? nullptr
++          : (texture_resolution_scaled
++                 ? load_pipelines_scaled_[load_shader].Get()
++                 : load_pipelines_[load_shader].Get());
++  {
++    // Diagnostics: the first texture of each guest format, and whether it
++    // can be loaded, for looking into missing textures.
++    static bool format_logged[64] = {};
++    uint32_t format_index = uint32_t(texture_key.format) & 63;
++    if (!format_logged[format_index]) {
++      format_logged[format_index] = true;
++      REXGPU_INFO(
++          "Texture format {} first used: {}x{}, host format {}, load shader "
++          "{}{}{}",
++          FormatInfo::Get(texture_key.format)->name, texture_key.GetWidth(),
++          texture_key.GetHeight(),
++          uint32_t(GetDXGIResourceFormat(texture_key)), int(load_shader),
++          texture_resolution_scaled ? ", resolution-scaled" : "",
++          pipeline ? "" : " - CAN'T BE LOADED");
++    }
++  }
+   if (pipeline == nullptr) {
+     return false;
+   }
+diff --git a/src/ui/windowed_app_main_uwp.cpp b/src/ui/windowed_app_main_uwp.cpp
+index a777be3..3ec72a2 100644
+--- a/src/ui/windowed_app_main_uwp.cpp
++++ b/src/ui/windowed_app_main_uwp.cpp
+@@ -127,6 +127,14 @@ int RunWindowedApp(IUnknown* core_window) {
+ 
+     if (app->OnInitialize()) {
+       REXLOG_INFO("UWP: app initialized, running the UI loop");
++      // Settings from LocalState/args.txt, so the log shows what was used.
++      if (utf8_args.size() > 1) {
++        for (size_t i = 1; i < utf8_args.size(); ++i) {
++          REXLOG_INFO("UWP: args.txt: {}", utf8_args[i]);
++        }
++      } else {
++        REXLOG_INFO("UWP: no args.txt settings");
++      }
+       result = app_context.RunMainMessageLoop();
+       REXLOG_INFO("UWP: UI loop ended (exit code {})", result);
+     } else {
+-- 
+2.43.0
+

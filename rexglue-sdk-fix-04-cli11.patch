@@ -1,0 +1,39 @@
+From e45e9208c8c8052ffcde40bb920589f79ca8d168 Mon Sep 17 00:00:00 2001
+From: dooset22 <dooset22@gmail.com>
+Date: Sun, 25 Oct 2026 21:31:53 -0400
+Subject: [PATCH] UWP: declare CommandLineToArgvW for CLI11
+
+CLI11's App::ensure_utf8 calls CommandLineToArgvW, which shellapi.h
+declares only for desktop apps, so cvar.cpp failed to compile for UWP.
+The helper isn't used, so a declaration is enough; nothing links it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ src/core/cvar.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index 9d485f5..292d753 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -9,6 +9,16 @@
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+ 
++#include <rex/platform.h>
++#if REX_PLATFORM_WINRT
++// CLI11 compiles a Windows-only helper (App::ensure_utf8, which isn't used
++// here) that calls CommandLineToArgvW, and shellapi.h declares that only for
++// desktop apps. Declaring it lets CLI11 compile for UWP; since nothing calls
++// the helper, the function is never linked.
++#include <windows.h>
++extern "C" __declspec(dllimport) LPWSTR* __stdcall CommandLineToArgvW(
++    LPCWSTR lpCmdLine, int* pNumArgs);
++#endif
+ #include <CLI/CLI.hpp>
+ 
+ #include <toml++/toml.hpp>
+-- 
+2.43.0
+

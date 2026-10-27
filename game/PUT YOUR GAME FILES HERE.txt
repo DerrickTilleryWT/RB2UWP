@@ -1,0 +1,4 @@
+Put your extracted Raging Blast 2 files in this folder.
+
+When you are done, default.xex must be directly in this folder (not in a
+subfolder), next to this note. You can delete this note.

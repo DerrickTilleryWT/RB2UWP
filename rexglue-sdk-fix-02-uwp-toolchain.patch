@@ -1,0 +1,183 @@
+From 5167afbd83841304a15cf89e244c22dc41c1f5da Mon Sep 17 00:00:00 2001
+From: dooset22 <dooset22@gmail.com>
+Date: Sun, 25 Oct 2026 21:08:07 -0400
+Subject: [PATCH] UWP: link CMake's compiler checks against WindowsApp; safer
+ lookups
+
+- Add rexglue_uwp_toolchain_file.cmake, used by the uwp-amd64 preset,
+  so CMake's compiler checks and other test programs link against
+  WindowsApp.lib. The app-container C runtime needs it (RoInitialize);
+  linking the desktop libraries made the compiler check fail.
+- Use -l flags for the default libraries with the clang driver.
+- Find ntdll through the critical section functions, which Windows
+  forwards to ntdll, instead of RtlCaptureContext (not declared for UWP).
+- Look up QueueUserAPC and ResumeThread at runtime on UWP, like the
+  other functions missing from some SDKs' UWP API partition.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ CMakePresets.json                          |  1 +
+ cmake/uwp/rexglue_uwp_toolchain.cmake      | 15 +++++++++++---
+ cmake/uwp/rexglue_uwp_toolchain_file.cmake | 22 +++++++++++++++++++++
+ src/core/platform_uwp.cpp                  | 23 ++++++++++++++++++----
+ src/core/threading.cpp                     | 23 +++++++++++++++++++++-
+ 5 files changed, 76 insertions(+), 8 deletions(-)
+ create mode 100644 cmake/uwp/rexglue_uwp_toolchain_file.cmake
+
+diff --git a/CMakePresets.json b/CMakePresets.json
+index ed9bc98..f85d25c 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -69,6 +69,7 @@
+             "displayName": "UWP AMD64 (Xbox Developer Mode)",
+             "description": "Multi-config UWP build for Xbox Series X|S Developer Mode. Configure from a prompt set up with 'vcvarsall.bat x64 uwp'. See docs/UWP.md.",
+             "inherits": "windows-base",
++            "toolchainFile": "${sourceDir}/cmake/uwp/rexglue_uwp_toolchain_file.cmake",
+             "cacheVariables": {
+                 "REXGLUE_UWP": "ON",
+                 "CMAKE_DEFAULT_BUILD_TYPE": "Release"
+diff --git a/cmake/uwp/rexglue_uwp_toolchain.cmake b/cmake/uwp/rexglue_uwp_toolchain.cmake
+index 9536fc2..d61a36a 100644
+--- a/cmake/uwp/rexglue_uwp_toolchain.cmake
++++ b/cmake/uwp/rexglue_uwp_toolchain.cmake
+@@ -21,9 +21,18 @@ if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+ endif()
+ 
+ # Link against WindowsApp.lib (the API surface available to UWP apps) instead
+-# of the desktop system import libraries CMake adds by default.
+-set(CMAKE_C_STANDARD_LIBRARIES "WindowsApp.lib")
+-set(CMAKE_CXX_STANDARD_LIBRARIES "WindowsApp.lib")
++# of the desktop system import libraries CMake adds by default. The toolchain
++# file (rexglue_uwp_toolchain_file.cmake, set by the uwp-amd64 presets) does
++# this before CMake's compiler checks; this covers builds configured without
++# it. The clang/clang++ driver needs -l flags: it rejects bare .lib names it
++# can't find as files.
++if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
++    set(CMAKE_C_STANDARD_LIBRARIES "-lWindowsApp -luuid -loldnames")
++    set(CMAKE_CXX_STANDARD_LIBRARIES "-lWindowsApp -luuid -loldnames")
++else()
++    set(CMAKE_C_STANDARD_LIBRARIES "WindowsApp.lib uuid.lib oldnames.lib")
++    set(CMAKE_CXX_STANDARD_LIBRARIES "WindowsApp.lib uuid.lib oldnames.lib")
++endif()
+ 
+ # The app-container libraries live in "store" folders of the MSVC and Windows
+ # SDK lib directories, which vcvarsall.bat only adds for the "uwp" platform.
+diff --git a/cmake/uwp/rexglue_uwp_toolchain_file.cmake b/cmake/uwp/rexglue_uwp_toolchain_file.cmake
+new file mode 100644
+index 0000000..4ebc8fd
+--- /dev/null
++++ b/cmake/uwp/rexglue_uwp_toolchain_file.cmake
+@@ -0,0 +1,22 @@
++# CMAKE_TOOLCHAIN_FILE for UWP builds (Xbox Developer Mode) - set by the
++# uwp-amd64 presets of the SDK and of games built with it.
++#
++# CMake reads a toolchain file before it checks the compilers, and again in
++# every test project it builds (compiler checks, check_symbol_exists, ...).
++# Those test programs are linked like the real app, so they have to link
++# against WindowsApp.lib: the app-container C runtime picked up by
++# 'vcvarsall.bat x64 uwp' needs it (for example RoInitialize), and the
++# default desktop libraries (kernel32, user32, ...) don't provide it.
++
++if(CMAKE_GENERATOR MATCHES "Visual Studio")
++  set(_rex_uwp_libs "WindowsApp.lib uuid.lib oldnames.lib")
++else()
++  # clang/clang++ (GNU-style driver), as used with Ninja.
++  set(_rex_uwp_libs "-lWindowsApp -luuid -loldnames")
++endif()
++foreach(_rex_lang C CXX)
++  set(CMAKE_${_rex_lang}_STANDARD_LIBRARIES "${_rex_uwp_libs}" CACHE STRING
++      "Libraries linked by default (UWP: the WindowsApp API surface)" FORCE)
++endforeach()
++unset(_rex_lang)
++unset(_rex_uwp_libs)
+diff --git a/src/core/platform_uwp.cpp b/src/core/platform_uwp.cpp
+index 2dd01b1..8ed1abe 100644
+--- a/src/core/platform_uwp.cpp
++++ b/src/core/platform_uwp.cpp
+@@ -47,14 +47,29 @@ HMODULE GetKernelBaseModule() {
+ HMODULE GetNtdllModule() {
+   static const HMODULE module = []() -> HMODULE {
+     HMODULE kernelbase = GetKernelBaseModule();
++    // The critical section functions are available to UWP apps and are
++    // forwarded by Windows to ntdll's Rtl* versions; imports resolve
++    // forwarders, so these addresses are inside ntdll. Accept a module only
++    // if it really exports the ntdll functions callers look up.
++    const void* candidates[] = {
++        reinterpret_cast<const void*>(&EnterCriticalSection),
++        reinterpret_cast<const void*>(&LeaveCriticalSection),
++        reinterpret_cast<const void*>(&DeleteCriticalSection),
++    };
++    for (const void* address : candidates) {
++      HMODULE candidate = ModuleFromAddress(address);
++      if (candidate && candidate != kernelbase &&
++          GetProcAddress(candidate, "RtlAddVectoredExceptionHandler")) {
++        return candidate;
++      }
++    }
++    // Fallback: kernelbase may export a forwarder to ntdll - GetProcAddress
++    // resolves forwarders, so the returned address is inside ntdll.
+     if (!kernelbase) {
+       return nullptr;
+     }
+-    // Forwarded by kernelbase to ntdll - GetProcAddress resolves forwarders,
+-    // so the returned address is inside ntdll.
+     FARPROC forwarded = GetProcAddress(kernelbase, "RtlCaptureContext");
+-    HMODULE ntdll =
+-        ModuleFromAddress(reinterpret_cast<const void*>(forwarded));
++    HMODULE ntdll = ModuleFromAddress(reinterpret_cast<const void*>(forwarded));
+     return ntdll != kernelbase ? ntdll : nullptr;
+   }();
+   return module;
+diff --git a/src/core/threading.cpp b/src/core/threading.cpp
+index 68f071b..0b5fcb3 100644
+--- a/src/core/threading.cpp
++++ b/src/core/threading.cpp
+@@ -38,7 +38,8 @@ using SetThreadAffinityMaskFn = DWORD_PTR(WINAPI*)(HANDLE, DWORD_PTR);
+ using TerminateThreadFn = BOOL(WINAPI*)(HANDLE, DWORD);
+ using SignalObjectAndWaitFn = DWORD(WINAPI*)(HANDLE, HANDLE, DWORD, BOOL);
+ using PulseEventFn = BOOL(WINAPI*)(HANDLE);
+-using SuspendThreadFn = DWORD(WINAPI*)(HANDLE);
++using SuspendThreadFn = DWORD(WINAPI*)(HANDLE);  // also ResumeThread
++using QueueUserAPCFn = DWORD(WINAPI*)(PAPCFUNC, HANDLE, ULONG_PTR);
+ 
+ template <typename T>
+ T Get(const char* name) {
+@@ -633,14 +634,34 @@ class Win32Thread : public Win32Handle<Thread> {
+ 
+   void QueueUserCallback(std::function<void()> callback) override {
+     auto apc_data = new ApcData({std::move(callback)});
++#if REX_PLATFORM_WINRT
++    // Not declared for the UWP API partition by every Windows SDK.
++    static const auto queue_user_apc =
++        uwp_compat::Get<uwp_compat::QueueUserAPCFn>("QueueUserAPC");
++    if (!queue_user_apc ||
++        !queue_user_apc(DispatchApc, handle_,
++                        reinterpret_cast<ULONG_PTR>(apc_data))) {
++      delete apc_data;
++    }
++#else
+     QueueUserAPC(DispatchApc, handle_, reinterpret_cast<ULONG_PTR>(apc_data));
++#endif
+   }
+ 
+   bool Resume(uint32_t* out_previous_suspend_count = nullptr) override {
+     if (out_previous_suspend_count) {
+       *out_previous_suspend_count = 0;
+     }
++#if REX_PLATFORM_WINRT
++    static const auto resume_thread =
++        uwp_compat::Get<uwp_compat::SuspendThreadFn>("ResumeThread");
++    if (!resume_thread) {
++      return false;
++    }
++    DWORD result = resume_thread(handle_);
++#else
+     DWORD result = ResumeThread(handle_);
++#endif
+     if (result == UINT_MAX) {
+       return false;
+     }
+-- 
+2.43.0
+

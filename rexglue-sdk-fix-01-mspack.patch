@@ -1,0 +1,37 @@
+From 4d9b80dbabf535be9ea13f144a73260de66a3892 Mon Sep 17 00:00:00 2001
+From: dooset22 <dooset22@gmail.com>
+Date: Sun, 25 Oct 2026 20:25:21 -0400
+Subject: [PATCH] Build libmspack from its real source folder on Windows
+
+thirdparty/libmspack/cabextract/mspack contains only symlinks into
+libmspack/mspack. Git for Windows checks symlinks out as text files
+holding the target path unless core.symlinks is enabled, so lzxd.c
+failed to compile. Use libmspack/mspack directly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ thirdparty/CMakeLists.txt | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index 9b227c7..838611b 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -97,8 +97,11 @@ target_include_directories(aes128 PUBLIC
+ target_compile_options(aes128 PRIVATE -w)
+ 
+ # libmspack - LZX decompression (only lzxd.c needed for XEX decompression)
+-# Uses cabextract version which has all needed headers in one place
+-set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/cabextract/mspack")
++# Uses libmspack/mspack, which has all needed headers in one place. (The
++# cabextract/mspack folder only holds symlinks to these files, and Git for
++# Windows checks symlinks out as small text files unless symlink support is
++# enabled, which breaks the build.)
++set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/libmspack/mspack")
+ add_library(mspack STATIC
+     ${MSPACK_DIR}/lzxd.c
+ )
+-- 
+2.43.0
+

@@ -1,0 +1,287 @@
+From 80466ea353e9d7893c6ea266cb56c3b3a9495db2 Mon Sep 17 00:00:00 2001
+From: dooset22 <dooset22@gmail.com>
+Date: Sun, 25 Oct 2026 09:05:32 -0400
+Subject: [PATCH] Add Xbox Series X|S Developer Mode (UWP) build
+
+Builds against a UWP build of the ReXGlue SDK (REXGLUE_UWP):
+
+- UWP entry point and rexglue_uwp_app() packaging; rb2_package target
+  builds a signed .msix, optionally including the game files
+  (RB2_UWP_GAME_FILES)
+- Game files from LocalState/assets take priority over packaged ones
+- Saves and user data in LocalState/rb2 instead of Documents
+- dlmalloc uses VirtualAllocFromApp in the app container
+- uwp-amd64-* presets (REXSDK_UWP) and README instructions
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T2Eqt3AmpbNRB9dC5uwqee
+---
+ CMakeLists.txt                 | 29 ++++++++++++++++++++++++++++-
+ CMakePresets.json              | 21 +++++++++++++++++++++
+ README.md                      | 25 +++++++++++++++++++++++++
+ src/bdengine/bd_init.h         |  3 ++-
+ src/bdengine/file_hooks.cpp    | 18 ++++++++++++++++--
+ src/main.cpp                   | 19 +++++++++++++++++++
+ thirdparty/dlmalloc/dlmalloc.c | 16 +++++++++++++---
+ 7 files changed, 124 insertions(+), 7 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3fa2016..25a0608 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -44,7 +44,11 @@ set(RB2_SOURCES
+ )
+ 
+ # Platform-specific entry point (provides main/wWinMain)
+-if(WIN32)
++if(REXGLUE_UWP)
++    # Xbox Developer Mode (UWP): CoreApplication entry point. REXGLUE_UWP is
++    # set by find_package(rexglue) when the SDK was built for UWP.
++    list(APPEND RB2_SOURCES ${REXGLUE_SHARE_DIR}/windowed_app_main_uwp.cpp)
++elseif(WIN32)
+     list(APPEND RB2_SOURCES ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
+ else()
+     list(APPEND RB2_SOURCES ${REXGLUE_SHARE_DIR}/windowed_app_main_posix.cpp)
+@@ -100,10 +104,33 @@ if(NOT MSVC)
+     target_compile_options(rb2 PRIVATE -msse4.1)
+ endif()
+ 
++# Xbox Developer Mode (UWP) package. Building rb2 updates the package layout;
++# the rb2_package target makes a signed .msix (see README).
++if(REXGLUE_UWP)
++    # Game files to put in the package (several GB). Leave empty to package
++    # only the app and copy the game files to LocalState/assets on the Xbox.
++    set(RB2_UWP_GAME_FILES "" CACHE PATH
++        "Extracted game files (with default.xex) to include in the Xbox package")
++    set(rb2_uwp_package_args)
++    if(RB2_UWP_GAME_FILES)
++        list(APPEND rb2_uwp_package_args GAME_FILES_DIR "${RB2_UWP_GAME_FILES}")
++    endif()
++    rexglue_uwp_app(rb2
++        NAME "ReXGlue.RB2"
++        DISPLAY_NAME "Raging Blast 2 Recompiled"
++        PUBLISHER "CN=ReXGlue RB2"
++        PUBLISHER_DISPLAY_NAME "rb2 (ReXGlue)"
++        DESCRIPTION "Dragon Ball: Raging Blast 2, recompiled with ReXGlue"
++        VERSION "1.0.0.0"
++        ${rb2_uwp_package_args})
++endif()
++
+ # Codegen target - run 'cmake --build . --target rb2_codegen'
++if(NOT REXGLUE_UWP)  # the recompiler isn't part of a UWP SDK build
+ add_custom_target(rb2_codegen
+     COMMAND $<TARGET_FILE:rex::rexglue> codegen ${CMAKE_CURRENT_SOURCE_DIR}/rb2_config.toml
+     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+     COMMENT "Generating recompiled code for rb2"
+     VERBATIM
+ )
++endif()
+diff --git a/CMakePresets.json b/CMakePresets.json
+index d61c1fc..ac5d308 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -32,6 +32,25 @@
+                 "rhs": "Linux"
+             }
+         },
++        {
++            "name": "uwp-base",
++            "hidden": true,
++            "inherits": "windows-base",
++            "description": "Xbox Developer Mode (UWP). Needs REXSDK_UWP set to a UWP build of the ReXGlue SDK, and a 'vcvarsall.bat x64 uwp' prompt.",
++            "environment": { "REXSDK": "$penv{REXSDK_UWP}" }
++        },
++        {
++            "name": "uwp-amd64-release",
++            "displayName": "Xbox (UWP) AMD64 Release",
++            "inherits": "uwp-base",
++            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
++        },
++        {
++            "name": "uwp-amd64-relwithdebinfo",
++            "displayName": "Xbox (UWP) AMD64 RelWithDebInfo",
++            "inherits": "uwp-base",
++            "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
++        },
+         {
+             "name": "win-amd64-debug",
+             "displayName": "Windows AMD64 Debug",
+@@ -70,6 +89,8 @@
+         }
+     ],
+     "buildPresets": [
++        { "name": "uwp-amd64-release", "configurePreset": "uwp-amd64-release" },
++        { "name": "uwp-amd64-relwithdebinfo", "configurePreset": "uwp-amd64-relwithdebinfo" },
+         { "name": "win-amd64-debug", "configurePreset": "win-amd64-debug" },
+         { "name": "win-amd64-release", "configurePreset": "win-amd64-release" },
+         { "name": "win-amd64-relwithdebinfo", "configurePreset": "win-amd64-relwithdebinfo" },
+diff --git a/README.md b/README.md
+index 7f56a65..2fc78e4 100644
+--- a/README.md
++++ b/README.md
+@@ -11,6 +11,31 @@ Recompiled using the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)
+ 1. Run cmake build for re2
+ 1. Launch with first argument pointing to the assets folder
+ 
++## Xbox Series X|S (Developer Mode)
++
++rb2 can be built as a UWP app for an Xbox Series X|S in Developer Mode. This
++needs a UWP build of the ReXGlue SDK (`REXGLUE_UWP=ON`, see the SDK's
++`docs/UWP.md`). Xbox One consoles aren't supported (no AVX2).
++
++1. Do the desktop setup above through the codegen step, so `generated/` exists.
++1. Build and install the SDK with its `uwp-amd64` preset, and set `REXSDK_UWP`
++   to that install folder.
++1. From a prompt set up with `vcvarsall.bat x64 uwp`:
++   ```bat
++   cmake --preset uwp-amd64-release -DRB2_UWP_GAME_FILES=%CD%\assets
++   cmake --build --preset uwp-amd64-release --target rb2_package
++   ```
++   `RB2_UWP_GAME_FILES` puts the game files in the package. Leave it out to
++   package only the app, then copy the game files to the app's
++   `LocalState\assets` folder on the Xbox (Device Portal file explorer).
++1. Install `out\build\uwp-amd64-release\uwp\rb2\Release\ReXGlue.RB2_1.0.0.0_x64.msix`
++   with the Device Portal, adding `Microsoft.VCLibs.x64.14.00.appx` (copied
++   next to it) as a dependency.
++1. In Dev Home, set the app's type to **Game**, then launch it.
++
++On the Xbox, saves and `log.txt` are in the app's `LocalState` folder.
++Command-line arguments go in `LocalState\args.txt`, one per line.
++
+ ## Credits
+ 
+ - [ReXGlue](https://github.com/rexglue/rexglue-sdk) for the recompilation tools.
+diff --git a/src/bdengine/bd_init.h b/src/bdengine/bd_init.h
+index 8e0df11..e78bb64 100644
+--- a/src/bdengine/bd_init.h
++++ b/src/bdengine/bd_init.h
+@@ -9,7 +9,8 @@ namespace bd {
+ void InitFileHooks(const std::filesystem::path& game_dir);
+ 
+ // Returns the user content root directory for saves and profile data.
+-// Windows: Documents/reblue   Linux: ~/.local/share/reblue
++// Windows: Documents/rb2   Linux: ~/.local/share/rb2
++// Xbox (UWP): the package's LocalState/rb2
+ std::filesystem::path GetUserContentRoot();
+ 
+ // Cache guest membase for game patch hooks
+diff --git a/src/bdengine/file_hooks.cpp b/src/bdengine/file_hooks.cpp
+index 47598a4..8583e43 100644
+--- a/src/bdengine/file_hooks.cpp
++++ b/src/bdengine/file_hooks.cpp
+@@ -37,9 +37,14 @@
+ #include <mutex>
+ #include <string>
+ 
+-#ifdef _WIN32
++#include <rex/platform.h>
++#if defined(_WIN32) && !REX_PLATFORM_WINRT
++#ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
+ #define NOMINMAX
++#endif
+ #include <shlobj.h>  // SHGetKnownFolderPath (save directory lookup only)
+ #endif
+ #include <algorithm>
+@@ -696,7 +701,16 @@ dword_result_t XFindNextFileA_entry(dword_t hFindFile, lpvoid_t lpFindFileData)
+ namespace bd {
+ 
+ std::filesystem::path GetUserContentRoot() {
+-#ifdef _WIN32
++#if REX_PLATFORM_WINRT
++    // UWP (Xbox Developer Mode): the package's private LocalState folder, the
++    // only persistent writable storage an app has. It's reachable from the
++    // Xbox Device Portal's file explorer for backing up saves.
++    auto local_folder = rex::filesystem::GetUserFolder();
++    if (local_folder.empty()) {
++        return {};
++    }
++    return local_folder / "rb2";
++#elif defined(_WIN32)
+     // Use SHGetKnownFolderPath to get the real Documents folder.
+     // %USERPROFILE%\Documents is WRONG when OneDrive folder backup is enabled.
+     PWSTR path = nullptr;
+diff --git a/src/main.cpp b/src/main.cpp
+index 9a99208..f41fe75 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <rex/cvar.h>
+ #include <rex/filesystem.h>
++#include <rex/platform.h>
+ #include <rex/runtime.h>
+ #include <rex/logging.h>
+ #include <rex/runtime/guest/function.h>
+@@ -64,6 +65,17 @@ public:
+             game_dir = *arg;
+         } else {
+             game_dir = exe_dir / "assets";
++#if REX_PLATFORM_WINRT
++            // Xbox: game files packaged with the app are in the (read-only)
++            // install folder. Files copied to LocalState/assets instead (for
++            // example with the Device Portal) take priority, so the app
++            // package can be installed without them.
++            auto local_assets = rex::filesystem::GetUserFolder() / "assets";
++            std::error_code ec;
++            if (std::filesystem::exists(local_assets / "default.xex", ec)) {
++                game_dir = local_assets;
++            }
++#endif
+         }
+ 
+         std::string log_file_cvar = "log.txt";
+@@ -80,7 +92,14 @@ public:
+         REXLOG_INFO("  Game directory: {}", game_dir.string());
+ 
+         // Create and initialize runtime
++#if REX_PLATFORM_WINRT
++        // User data (saves, profiles) can't go in the game directory on Xbox,
++        // which may be the read-only install folder.
++        runtime_ = std::make_unique<rex::Runtime>(game_dir, bd::GetUserContentRoot());
++        REXLOG_INFO("  User data directory: {}", bd::GetUserContentRoot().string());
++#else
+         runtime_ = std::make_unique<rex::Runtime>(game_dir);
++#endif
+         runtime_->set_app_context(&app_context());
+ 
+         auto status = runtime_->Setup(
+diff --git a/thirdparty/dlmalloc/dlmalloc.c b/thirdparty/dlmalloc/dlmalloc.c
+index 35003d1..789f73d 100644
+--- a/thirdparty/dlmalloc/dlmalloc.c
++++ b/thirdparty/dlmalloc/dlmalloc.c
+@@ -1672,16 +1672,26 @@ static int dev_zero_fd = -1; /* Cached file descriptor for /dev/zero. */
+ 
+ #else /* WIN32 */
+ 
++/* UWP apps (Xbox Developer Mode) allocate with VirtualAllocFromApp, which
++   takes the same arguments. rb2 note: this is the only change to dlmalloc. */
++#if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_APP)
++#define DLMALLOC_VIRTUAL_ALLOC(a, s, t, p) VirtualAllocFromApp((a), (s), (t), (p))
++#else
++#define DLMALLOC_VIRTUAL_ALLOC(a, s, t, p) VirtualAlloc((a), (s), (t), (p))
++#endif
++
+ /* Win32 MMAP via VirtualAlloc */
+ static FORCEINLINE void* win32mmap(size_t size) {
+-  void* ptr = VirtualAlloc(0, size, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
++  void* ptr = DLMALLOC_VIRTUAL_ALLOC(0, size, MEM_RESERVE|MEM_COMMIT,
++                                     PAGE_READWRITE);
+   return (ptr != 0)? ptr: MFAIL;
+ }
+ 
+ /* For direct MMAP, use MEM_TOP_DOWN to minimize interference */
+ static FORCEINLINE void* win32direct_mmap(size_t size) {
+-  void* ptr = VirtualAlloc(0, size, MEM_RESERVE|MEM_COMMIT|MEM_TOP_DOWN,
+-                           PAGE_READWRITE);
++  void* ptr = DLMALLOC_VIRTUAL_ALLOC(0, size,
++                                     MEM_RESERVE|MEM_COMMIT|MEM_TOP_DOWN,
++                                     PAGE_READWRITE);
+   return (ptr != 0)? ptr: MFAIL;
+ }
+ 
+-- 
+2.43.0
+
